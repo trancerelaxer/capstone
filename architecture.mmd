@@ -1,0 +1,76 @@
+flowchart TB
+    U["User"] --> M["main.py (mode router)"]
+    M --> MODE{"Mode"}
+    MODE --> WEB["web (default)"]
+    MODE --> CLI["cli"]
+    MODE --> ING["ingest-docs"]
+
+    WEB --> H["lm_studio_health.py<br/>check /v1/models"]
+    CLI --> H
+    ING --> H
+
+    subgraph DOCS["Data Prep: Knowledge Ingestion"]
+        D1["grafana_docs_ingest.py<br/>fetch Grafana docs + GitHub dashboards"]
+        D2["Extract docs HTML->text + dashboard JSON->text"]
+        D3["Chunk text + metadata (source/doc_url/chunk_index)"]
+        E["embeddings.py<br/>LM Studio /v1/embeddings + cache"]
+        V["vector_store.py<br/>Qdrant local persistent"]
+        D1 --> D2 --> D3 --> E --> V
+    end
+
+    H --> D1
+    V --> A["src/runtime_engine/{base,spec_inference,planner,pipeline,runner}.py<br/>(exposed via agent.py)"]
+    WEB --> W["web_ui.py"]
+    W --> A
+    CLI --> C["CLI prompt"]
+    C --> A
+
+    subgraph AG["Reasoning + Tool Calling + Reflection"]
+        P["Planner (LLM)"]
+        X["Tool Executor"]
+        R1["retrieve_context (Grafana docs + Kubernetes dashboards RAG)"]
+        R2["retrieve_repo_context (codebase snippets)"]
+        R3["read_repo_file (precise lines)"]
+        R4["safe_calculate"]
+        R5["write_brief"]
+        R6["generate_grafana_dashboard"]
+        R7["generate_grafana_alert_rule"]
+        R8["generate_prompt_template"]
+        R9["lint_grafana_dashboard<br/>schema+grid+promql quality gate"]
+        R10["check_prometheus_metrics<br/>metric availability probe"]
+        R11["patch_grafana_dashboard<br/>apply fixes + emit unified diff"]
+        S["Answer synthesis"]
+        RF["Self-reflection scoring"]
+        RETRY["Optional retry with deeper retrieval / dashboard regen"]
+        P --> X
+        X --> R1
+        X --> R2
+        X --> R3
+        X --> R4
+        X --> R5
+        X --> R6
+        X --> R7
+        X --> R8
+        X --> R9
+        X --> R10
+        X --> R11
+        R1 --> S
+        R2 --> S
+        R3 --> S
+        R4 --> S
+        R5 --> S
+        R6 --> S
+        R7 --> S
+        R8 --> S
+        R9 --> S
+        R10 --> S
+        R11 --> S
+        S --> RF --> RETRY --> S
+    end
+
+    A --> P
+    S --> OUT["Answer + reflection + downloadable artifacts"]
+    OUT --> U
+
+    EVAL["evaluate_agent.py<br/>fixed benchmark + pass-rate report"] --> A
+    EVAL --> REP["data/output/agent_evaluation_report.json"]

@@ -1,0 +1,294 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Grafana DevOps Chatbot</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; margin: 2rem; max-width: 960px; }
+    .chat { border: 1px solid #ddd; border-radius: 12px; padding: 1rem; min-height: 360px; background: #fafafa; }
+    .msg { margin-bottom: 1rem; padding: 0.75rem; border-radius: 10px; }
+    .user { background: #eaf4ff; }
+    .bot { background: #f4f4f4; }
+    .label { font-weight: 700; margin-bottom: 0.3rem; }
+    .content { white-space: pre-wrap; word-wrap: break-word; margin: 0; }
+    .bot .content { white-space: normal; line-height: 1.45; }
+    .bot .content code { background: #eee; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    .bot .content pre { background: #eee; padding: 0.75rem; border-radius: 8px; overflow-x: auto; }
+    .bot .content a { color: #0b57d0; text-decoration: underline; }
+    .reflection { margin-top: 0.5rem; font-size: 0.95rem; color: #333; }
+    .artifacts { margin-top: 0.5rem; font-size: 0.95rem; }
+    .artifacts a { margin-right: 0.5rem; }
+    .empty { color: #666; }
+    .working-status { margin-top: 0.5rem; font-size: 0.92rem; color: #555; }
+    form { margin-top: 1rem; }
+    .input-row { display: flex; gap: 0.75rem; align-items: stretch; }
+    textarea { flex: 1; min-height: 100px; padding: 0.75rem; font-size: 1rem; }
+    button { width: 110px; font-size: 1rem; }
+    #status { margin-top: 0.75rem; font-size: 0.95rem; color: #444; min-height: 1.25rem; }
+  </style>
+</head>
+<body>
+  <h1>Grafana Chatbot</h1>
+  <div id="chat" class="chat"><div class='empty'>No messages yet. Ask your first question.</div></div>
+
+  <form id="ask-form">
+    <div class="input-row">
+      <textarea id="question" placeholder="Ask about Grafana docs, dashboards, alerts, or prompt templates..."></textarea>
+      <button type="submit" id="ask-btn">Ask</button>
+    </div>
+    <div id="status"></div>
+  </form>
+
+  <script>
+    const form = document.getElementById('ask-form');
+    const questionEl = document.getElementById('question');
+    const askBtn = document.getElementById('ask-btn');
+    const statusEl = document.getElementById('status');
+    let statusTimer = null;
+    let statusStartTs = 0;
+
+    const ASSISTANT_STATUS_STEPS = [
+      { atMs: 0, label: 'Analyzing request' },
+      { atMs: 1400, label: 'Retrieving context' },
+      { atMs: 3600, label: 'Running tools' },
+      { atMs: 7200, label: 'Synthesizing answer' },
+      { atMs: 11000, label: 'Finalizing response' }
+    ];
+
+    function esc(s) {
+      return String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+    }
+
+    function renderMarkdown(text) {
+      let html = esc(text || '');
+      const codeBlocks = [];
+      html = html.replace(/```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g, (_m, lang, code) => {
+        const rendered = `<pre><code>${code}</code></pre>`;
+        const idx = codeBlocks.push(rendered) - 1;
+        return `@@CODE_BLOCK_${idx}@@`;
+      });
+      html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+      html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      html = html.replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s).,!?;:])/g, '$1<em>$2</em>');
+      html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+      html = html.replace(/\n/g, '<br>');
+      html = html.replace(/@@CODE_BLOCK_(\d+)@@/g, (_m, idx) => codeBlocks[Number(idx)] || '');
+      return html;
+    }
+
+    function appendUserMessage(q) {
+      const chat = document.getElementById('chat');
+      const empty = chat.querySelector('.empty');
+      if (empty) empty.remove();
+      chat.insertAdjacentHTML('beforeend', `
+        <div class="msg user">
+          <div class="label">You</div>
+          <div class="content">${esc(q)}</div>
+        </div>
+      `);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function appendWorkingMessage() {
+      const chat = document.getElementById('chat');
+      const empty = chat.querySelector('.empty');
+      if (empty) empty.remove();
+      chat.insertAdjacentHTML('beforeend', `
+        <div class="msg bot" id="working-msg">
+          <div class="label">Assistant</div>
+          <div class="content" id="working-content">Analyzing request...</div>
+          <div class="working-status" id="working-status">Status: analyzing</div>
+        </div>
+      `);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function updateWorkingStatus(text) {
+      statusEl.textContent = `Assistant: ${text}`;
+      const workingStatus = document.getElementById('working-status');
+      if (workingStatus) {
+        workingStatus.textContent = `Status: ${text}`;
+      }
+      const workingContent = document.getElementById('working-content');
+      if (workingContent) {
+        workingContent.textContent = text;
+      }
+    }
+
+    function pickStatusLabel(elapsedMs) {
+      let label = ASSISTANT_STATUS_STEPS[0].label;
+      for (const step of ASSISTANT_STATUS_STEPS) {
+        if (elapsedMs >= step.atMs) label = step.label;
+      }
+      return label;
+    }
+
+    function startAssistantStatus() {
+      stopAssistantStatus({ clearOnly: true });
+      statusStartTs = Date.now();
+      const tick = () => {
+        const elapsedMs = Date.now() - statusStartTs;
+        const elapsedSec = Math.max(0, Math.floor(elapsedMs / 1000));
+        const dots = '.'.repeat((Math.floor(elapsedMs / 500) % 3) + 1);
+        const label = pickStatusLabel(elapsedMs);
+        updateWorkingStatus(`${label}${dots} (${elapsedSec}s)`);
+      };
+      tick();
+      statusTimer = setInterval(tick, 500);
+    }
+
+    function stopAssistantStatus({ finalText = '', clearOnly = false } = {}) {
+      if (statusTimer) {
+        clearInterval(statusTimer);
+        statusTimer = null;
+      }
+      if (clearOnly) return;
+      if (finalText) {
+        statusEl.textContent = finalText;
+        setTimeout(() => {
+          if (statusEl.textContent === finalText) statusEl.textContent = '';
+        }, 1400);
+      } else {
+        statusEl.textContent = '';
+      }
+    }
+
+    function renderArtifacts(artifacts) {
+      if (!Array.isArray(artifacts) || artifacts.length === 0) return '';
+      const links = artifacts
+        .map(a => {
+          if (!a) return '';
+          if (a.name) return a.name;
+          if (a.path) return a.path.split('/').pop();
+          return '';
+        })
+        .filter(Boolean)
+        .map(name => `<a href="/download?name=${encodeURIComponent(name)}" download>${esc(name)}</a>`);
+      if (links.length === 0) return '';
+      return `<div class="artifacts"><strong>Generated files:</strong> ${links.join(' | ')}</div>`;
+    }
+
+    function replaceWorkingWithAnswer(answer, reflection, artifacts) {
+      const g = reflection.groundedness_score ?? 'n/a';
+      const c = reflection.completeness_score ?? 'n/a';
+      const a = reflection.actionability_score ?? 'n/a';
+      const artifactsHtml = renderArtifacts(artifacts);
+      const working = document.getElementById('working-msg');
+      if (!working) return;
+      working.outerHTML = `
+        <div class="msg bot">
+          <div class="label">Assistant</div>
+          <div class="content">${renderMarkdown(answer)}</div>
+          ${artifactsHtml}
+          <div class="reflection">Agent Evaluation: groundedness=${g}/5, completeness=${c}/5, actionability=${a}/5</div>
+        </div>
+      `;
+      const chat = document.getElementById('chat');
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function loadHistory() {
+      const chat = document.getElementById('chat');
+      const raw = sessionStorage.getItem('chat_history');
+      if (!raw) return;
+      let history = [];
+      try { history = JSON.parse(raw); } catch (_e) { return; }
+      if (!Array.isArray(history) || history.length === 0) return;
+      chat.innerHTML = '';
+      history.forEach(item => {
+        appendUserMessage(item.question || '');
+        const answer = item.answer || '';
+        const reflection = item.reflection || {};
+        const artifacts = item.artifacts || [];
+        const g = reflection.groundedness_score ?? 'n/a';
+        const c = reflection.completeness_score ?? 'n/a';
+        const a = reflection.actionability_score ?? 'n/a';
+        const artifactsHtml = renderArtifacts(artifacts);
+        chat.insertAdjacentHTML('beforeend', `
+          <div class="msg bot">
+            <div class="label">Assistant</div>
+            <div class="content">${renderMarkdown(answer)}</div>
+            ${artifactsHtml}
+            <div class="reflection">Agent Evaluation: groundedness=${g}/5, completeness=${c}/5, actionability=${a}/5</div>
+          </div>
+        `);
+      });
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function persistMessage(question, answer, reflection, artifacts) {
+      const raw = sessionStorage.getItem('chat_history');
+      let history = [];
+      try { history = raw ? JSON.parse(raw) : []; } catch (_e) { history = []; }
+      if (!Array.isArray(history)) history = [];
+      history.push({ question, answer, reflection, artifacts });
+      sessionStorage.setItem('chat_history', JSON.stringify(history));
+    }
+
+    function getLatestDashboardFile() {
+      const raw = sessionStorage.getItem('chat_history');
+      if (!raw) return '';
+      let history = [];
+      try { history = JSON.parse(raw); } catch (_e) { return ''; }
+      if (!Array.isArray(history)) return '';
+      for (let i = history.length - 1; i >= 0; i--) {
+        const artifacts = history[i].artifacts || [];
+        if (!Array.isArray(artifacts)) continue;
+        for (const a of artifacts) {
+          if (a && a.type === 'dashboard_json' && a.name) return a.name;
+        }
+      }
+      return '';
+    }
+
+    async function submitQuestion() {
+      const q = questionEl.value.trim();
+      if (!q) return;
+
+      appendUserMessage(q);
+      appendWorkingMessage();
+      startAssistantStatus();
+      askBtn.disabled = true;
+      questionEl.value = '';
+
+      try {
+        const resp = await fetch('/api/ask', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: q, latest_dashboard_file: getLatestDashboardFile() })
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          throw new Error(data.error || 'Request failed.');
+        }
+        replaceWorkingWithAnswer(data.answer || '', data.reflection || {}, data.artifacts || []);
+        persistMessage(q, data.answer || '', data.reflection || {}, data.artifacts || []);
+        stopAssistantStatus({ finalText: 'Assistant response received.' });
+      } catch (err) {
+        replaceWorkingWithAnswer('Request failed. Please try again.', {}, []);
+        stopAssistantStatus({ finalText: 'Assistant request failed.' });
+      } finally {
+        askBtn.disabled = false;
+      }
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      await submitQuestion();
+    });
+
+    questionEl.addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        await submitQuestion();
+      }
+    });
+
+    loadHistory();
+  </script>
+</body>
+</html>
